@@ -8,10 +8,11 @@
       pkgs = nixpkgs.legacyPackages.x86_64-linux;
     in {
       # Rust itself comes from the systemwide toolchain. alsa-lib is for
-      # midir's ALSA backend; fluidsynth and $SOUNDFONT are a synth to play through.
+      # midir's ALSA backend; fluidsynth and $SOUNDFONT are a synth to play through;
+      # alsa-utils provides aconnect for wiring them together.
       devShells.x86_64-linux.default = pkgs.mkShell {
         nativeBuildInputs = [ pkgs.pkg-config ];
-        buildInputs = [ pkgs.alsa-lib pkgs.fluidsynth ];
+        buildInputs = [ pkgs.alsa-lib pkgs.fluidsynth pkgs.alsa-utils ];
         SOUNDFONT = "${pkgs.soundfont-fluid}/share/soundfonts/FluidR3_GM2-2.sf2";
       };
     };
