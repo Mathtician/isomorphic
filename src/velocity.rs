@@ -26,12 +26,17 @@ const REST_POLLS_BEFORE_WARNING: u32 = 5;
 pub struct Curve {
     fast: Duration,
     slow: Duration,
+    /// Velocity at `slow`, 1..=127.
+    floor: u8,
 }
 
 impl Curve {
-    pub fn new(fast: Duration, slow: Duration) -> Result<Curve, String> {
+    pub fn new(fast: Duration, slow: Duration, floor: u8) -> Result<Curve, String> {
+        if !(1..=127).contains(&floor) {
+            return Err(format!("velocity floor {floor} not in 1..=127"));
+        }
         if Duration::ZERO < fast && fast < slow {
-            Ok(Curve { fast, slow })
+            Ok(Curve { fast, slow, floor })
         } else {
             Err(format!(
                 "need 0 < fast < slow, got fast {fast:?}, slow {slow:?}"
@@ -39,12 +44,12 @@ impl Curve {
         }
     }
 
-    /// `fast` or quicker gives 127; `slow` or slower gives 1.
+    /// `fast` or quicker gives 127; `slow` or slower gives `floor`.
     pub fn velocity(&self, descent: Duration) -> u8 {
         let d = descent.clamp(self.fast, self.slow).as_secs_f64();
         let (fast, slow) = (self.fast.as_secs_f64(), self.slow.as_secs_f64());
         let slowness = (d / fast).ln() / (slow / fast).ln(); // 0 at fast, 1 at slow
-        (127.0 - 126.0 * slowness).round() as u8
+        (127.0 - (127 - self.floor) as f64 * slowness).round() as u8
     }
 }
 
@@ -178,13 +183,20 @@ mod tests {
 
     #[test]
     fn curve_endpoints_and_log_midpoint() {
-        let c = Curve::new(ms(2.0), ms(32.0)).unwrap();
+        let c = Curve::new(ms(2.0), ms(32.0), 1).unwrap();
         assert_eq!(c.velocity(ms(0.5)), 127);
         assert_eq!(c.velocity(ms(2.0)), 127);
         assert_eq!(c.velocity(ms(8.0)), 64); // geometric midpoint of 2 and 32
         assert_eq!(c.velocity(ms(32.0)), 1);
         assert_eq!(c.velocity(ms(1000.0)), 1);
-        assert!(Curve::new(ms(5.0), ms(5.0)).is_err());
+        assert!(Curve::new(ms(5.0), ms(5.0), 1).is_err());
+        assert!(Curve::new(ms(2.0), ms(32.0), 0).is_err());
+
+        let c = Curve::new(ms(2.0), ms(32.0), 31).unwrap();
+        assert_eq!(c.velocity(ms(2.0)), 127);
+        assert_eq!(c.velocity(ms(8.0)), 79); // halfway between 127 and 31
+        assert_eq!(c.velocity(ms(32.0)), 31);
+        assert_eq!(c.velocity(ms(1000.0)), 31);
     }
 
     #[test]

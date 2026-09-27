@@ -132,9 +132,12 @@ struct Args {
     /// below which velocity is 127
     #[arg(long, default_value_t = 2.0)]
     fast_ms: f64,
-    /// With --keychron: descent time (ms) at or above which velocity is 1
+    /// With --keychron: descent time (ms) at or above which velocity is --min-velocity
     #[arg(long, default_value_t = 40.0)]
     slow_ms: f64,
+    /// With --keychron: velocity of the slowest presses
+    #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u8).range(1..=127))]
+    min_velocity: u8,
     /// With --keychron: print each note's descent time and velocity, for tuning
     /// --fast-ms and --slow-ms
     #[arg(long)]
@@ -351,6 +354,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let curve = Curve::new(
             Duration::from_secs_f64(args.fast_ms / 1000.0),
             Duration::from_secs_f64(args.slow_ms / 1000.0),
+            args.min_velocity,
         )?;
         Velocity::Measured(Measurer::new(hid, curve, args.strike_depth))
     } else {
