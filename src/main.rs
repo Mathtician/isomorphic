@@ -11,10 +11,20 @@
 //! events, no autorepeat) with the device grabbed so keystrokes don't leak into
 //! other programs. Output is a virtual ALSA MIDI port for any synth to connect to.
 
-use std::{collections::HashMap, path::PathBuf, thread, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::mpsc,
+    thread,
+    time::{Duration, SystemTime},
+};
 
 use clap::Parser;
 use evdev::{Device, EventSummary, KeyCode};
+use isomorphic::{
+    keychron::{self, Hid},
+    velocity::{Curve, Measurer},
+};
 use midir::{MidiOutput, MidiOutputConnection, os::unix::VirtualOutput};
 
 /// Physical key rows, bottom to top, each paired with a label for the startup grid.
@@ -107,12 +117,28 @@ const AUTOREPEAT: i32 = 2;
     about = "Play the keyboard as a Wicki-Hayden MIDI controller. ` and 1 shift octaves; Esc quits."
 )]
 struct Args {
-    /// evdev keyboard device to read (and grab)
-    #[arg(
-        long,
-        default_value = "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
-    )]
-    device: PathBuf,
+    /// evdev keyboard device to read (and grab) [default: the laptop keyboard,
+    /// or the Keychron's with --keychron]
+    #[arg(long)]
+    device: Option<PathBuf>,
+    /// Play a Keychron Q1 HE with velocity measured from its analog key travel
+    #[arg(long)]
+    keychron: bool,
+    /// With --keychron: depth at which a key sounds, in 1/60 mm (240 = full
+    /// travel). Must be deeper than the actuation point set in Keychron Launcher.
+    #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u8).range(1..=230))]
+    strike_depth: u8,
+    /// With --keychron: descent time (actuation to strike depth, ms) at or
+    /// below which velocity is 127
+    #[arg(long, default_value_t = 2.0)]
+    fast_ms: f64,
+    /// With --keychron: descent time (ms) at or above which velocity is 1
+    #[arg(long, default_value_t = 40.0)]
+    slow_ms: f64,
+    /// With --keychron: print each note's descent time and velocity, for tuning
+    /// --fast-ms and --slow-ms
+    #[arg(long)]
+    show_timing: bool,
     /// MIDI note number of the Z key (48 = C3)
     #[arg(long, default_value_t = 48)]
     base: u8,
@@ -120,7 +146,7 @@ struct Args {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=16))]
     channel: u8,
     /// Note-on velocity (laptop keys aren't velocity-sensitive)
-    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u8).range(1..=127))]
+    #[arg(long, conflicts_with = "keychron", default_value_t = 100, value_parser = clap::value_parser!(u8).range(1..=127))]
     velocity: u8,
     /// Connect directly to the one MIDI input port whose name contains this
     /// (e.g. "FLUID" for fluidsynth). The connection is made before the
@@ -220,7 +246,6 @@ struct Player<'a> {
     layout: &'a Layout,
     out: MidiOutputConnection,
     channel: u8, // 0-based
-    velocity: u8,
     /// Current octave shift; `layout` transposed by it always stays in MIDI range.
     octave: i32,
     held: HashMap<KeyCode, Note>,
@@ -231,7 +256,7 @@ impl Player<'_> {
         self.held.values().any(|&n| n == note)
     }
 
-    fn press(&mut self, key: KeyCode) -> Result<(), midir::SendError> {
+    fn press(&mut self, key: KeyCode, velocity: u8) -> Result<(), midir::SendError> {
         let Some(note) = self.layout.note(key) else {
             return Ok(());
         };
@@ -244,8 +269,7 @@ impl Player<'_> {
         let was_sounding = self.is_sounding(note);
         self.held.insert(key, note);
         if !was_sounding {
-            self.out
-                .send(&[0x90 | self.channel, note.0, self.velocity])?;
+            self.out.send(&[0x90 | self.channel, note.0, velocity])?;
         }
         Ok(())
     }
@@ -295,12 +319,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let layout = Layout::new(args.base)?;
     layout.print_grid();
 
-    let mut device = Device::open(&args.device).map_err(|e| {
-        format!(
-            "opening {}: {e} (are you in the `input` group?)",
-            args.device.display()
-        )
-    })?;
+    let device_path = args.device.clone().unwrap_or_else(|| {
+        PathBuf::from(if args.keychron {
+            keychron::KEYBOARD
+        } else {
+            "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
+        })
+    });
+    let mut device = Device::open(&device_path)
+        .map_err(|e| format!("opening {}: {e} (no read access?)", device_path.display()))?;
     let supported = device.supported_keys().ok_or("device reports no keys")?;
     for &(key, _) in layout.keys.iter().chain(&[
         (QUIT_KEY, Note(0)),
@@ -311,6 +338,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("device {:?} lacks key {key:?}", device.name()).into());
         }
     }
+
+    let mut velocity = if args.keychron {
+        for &(key, _) in &layout.keys {
+            assert!(
+                keychron::matrix_pos(key).is_some(),
+                "no matrix position for {key:?}"
+            );
+        }
+        let hid = Hid::open(keychron::HIDRAW)
+            .map_err(|e| format!("opening {}: {e} (no read/write access?)", keychron::HIDRAW))?;
+        let curve = Curve::new(
+            Duration::from_secs_f64(args.fast_ms / 1000.0),
+            Duration::from_secs_f64(args.slow_ms / 1000.0),
+        )?;
+        Velocity::Measured(Measurer::new(hid, curve, args.strike_depth))
+    } else {
+        Velocity::Fixed(args.velocity)
+    };
 
     let out = open_midi(&args)?;
     println!("Reading {:?}.", device.name().unwrap_or("?"));
@@ -326,18 +371,55 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     device.grab()?;
     println!("Keyboard grabbed. Play! Esc quits.");
 
+    // Key events come from a thread blocking on the device, so the main loop
+    // can poll key travel while waiting for them. The grab ends when the
+    // process exits and the device is closed.
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || read_keys(device, tx));
+
     let mut player = Player {
         layout: &layout,
         out,
         channel: args.channel - 1,
-        velocity: args.velocity,
         octave: 0,
         held: HashMap::new(),
     };
-    let result = play(&mut device, &mut player);
+    let result = play(&rx, &mut player, &mut velocity, args.show_timing);
     player.release_all()?;
-    device.ungrab()?;
     result
+}
+
+/// Where note-on velocities come from.
+enum Velocity {
+    Fixed(u8),
+    Measured(Measurer),
+}
+
+struct KeyEvent {
+    key: KeyCode,
+    value: i32,
+    time: SystemTime,
+}
+
+/// Forwards key events until the device fails or the receiver is gone.
+fn read_keys(mut device: Device, tx: mpsc::Sender<Result<KeyEvent, String>>) {
+    loop {
+        let events = match device.fetch_events() {
+            Ok(events) => events,
+            Err(e) => {
+                let _ = tx.send(Err(format!("reading keyboard: {e}")));
+                return;
+            }
+        };
+        for event in events {
+            if let EventSummary::Key(_, key, value) = event.destructure() {
+                let time = event.timestamp();
+                if tx.send(Ok(KeyEvent { key, value, time })).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn open_midi(args: &Args) -> Result<MidiOutputConnection, Box<dyn std::error::Error>> {
@@ -375,27 +457,80 @@ fn open_midi(args: &Args) -> Result<MidiOutputConnection, Box<dyn std::error::Er
 }
 
 /// Runs until the quit key is pressed or an error occurs.
-fn play(device: &mut Device, player: &mut Player) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// While any key is on its way down (only with measured velocity), key events
+/// are checked between travel polls; otherwise we just wait for the next one.
+fn play(
+    rx: &mpsc::Receiver<Result<KeyEvent, String>>,
+    player: &mut Player,
+    velocity: &mut Velocity,
+    show_timing: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        for event in device.fetch_events()? {
-            let EventSummary::Key(_, key, value) = event.destructure() else {
-                continue;
-            };
-            match value {
-                PRESS if key == QUIT_KEY => return Ok(()),
-                PRESS if key == OCTAVE_DOWN || key == OCTAVE_UP => {
-                    let delta = if key == OCTAVE_UP { 1 } else { -1 };
-                    if player.shift_octave(delta) {
-                        println!("Octave {:+}", player.octave);
-                    } else {
-                        println!("Octave {:+} is the limit", player.octave);
-                    }
+        let polling = match velocity {
+            Velocity::Measured(m) => !m.is_idle(),
+            Velocity::Fixed(_) => false,
+        };
+        let event = if polling {
+            match rx.try_recv() {
+                Ok(event) => Some(event),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    unreachable!("reader exits only after sending an error, which ends play")
                 }
-                PRESS => player.press(key)?,
-                RELEASE => player.release(key)?,
-                AUTOREPEAT => {}
-                v => return Err(format!("unexpected key event value {v} for {key:?}").into()),
             }
+        } else {
+            Some(
+                rx.recv()
+                    .expect("reader thread reports errors before exiting"),
+            )
+        };
+
+        let Some(event) = event else {
+            let Velocity::Measured(m) = velocity else {
+                unreachable!("only measured velocity polls")
+            };
+            if let Some(strike) = m.poll()? {
+                if show_timing {
+                    println!(
+                        "{:?}: {:.1} ms -> velocity {}",
+                        strike.key,
+                        strike.descent.as_secs_f64() * 1000.0,
+                        strike.velocity
+                    );
+                }
+                player.press(strike.key, strike.velocity)?;
+            }
+            continue;
+        };
+
+        let KeyEvent { key, value, time } = event?;
+        match value {
+            PRESS if key == QUIT_KEY => return Ok(()),
+            PRESS if key == OCTAVE_DOWN || key == OCTAVE_UP => {
+                let delta = if key == OCTAVE_UP { 1 } else { -1 };
+                if player.shift_octave(delta) {
+                    println!("Octave {:+}", player.octave);
+                } else {
+                    println!("Octave {:+} is the limit", player.octave);
+                }
+            }
+            PRESS if player.layout.note(key).is_some() => match velocity {
+                Velocity::Fixed(v) => player.press(key, *v)?,
+                Velocity::Measured(m) => {
+                    let pos = keychron::matrix_pos(key).expect("checked at startup");
+                    m.press(key, pos, time);
+                }
+            },
+            PRESS => {}
+            RELEASE => {
+                if let Velocity::Measured(m) = velocity {
+                    m.release(key);
+                }
+                player.release(key)?;
+            }
+            AUTOREPEAT => {}
+            v => return Err(format!("unexpected key event value {v} for {key:?}").into()),
         }
     }
 }
