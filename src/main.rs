@@ -12,7 +12,7 @@
 //! other programs. Output is a virtual ALSA MIDI port for any synth to connect to.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::mpsc,
     thread,
@@ -106,6 +106,8 @@ const UP_LEFT: u32 = 5;
 const QUIT_KEY: KeyCode = KeyCode::KEY_ESC;
 const OCTAVE_DOWN: KeyCode = KeyCode::KEY_GRAVE;
 const OCTAVE_UP: KeyCode = KeyCode::KEY_1;
+/// Either Shift works the sustain pedal; it's down while at least one is held.
+const SUSTAIN_KEYS: [KeyCode; 2] = [KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_RIGHTSHIFT];
 
 // evdev key event values.
 const RELEASE: i32 = 0;
@@ -114,7 +116,7 @@ const AUTOREPEAT: i32 = 2;
 
 #[derive(Parser)]
 #[command(
-    about = "Play the keyboard as a Wicki-Hayden MIDI controller. ` and 1 shift octaves; Esc quits."
+    about = "Play the keyboard as a Wicki-Hayden MIDI controller. ` and 1 shift octaves; Shift sustains; Esc quits."
 )]
 struct Args {
     /// evdev keyboard device to read (and grab) [default: the laptop keyboard,
@@ -245,6 +247,9 @@ impl Layout {
 ///
 /// Octave shifts apply to subsequent presses only: `held` records the note each
 /// key actually started, and that is the note its release stops.
+///
+/// Sustain is left to the synth (MIDI CC 64): we send note-offs as usual and
+/// the synth holds the sound while the pedal is down.
 struct Player<'a> {
     layout: &'a Layout,
     out: MidiOutputConnection,
@@ -252,6 +257,8 @@ struct Player<'a> {
     /// Current octave shift; `layout` transposed by it always stays in MIDI range.
     octave: i32,
     held: HashMap<KeyCode, Note>,
+    /// Sustain keys currently down; the pedal is down iff this is nonempty.
+    sustain_held: HashSet<KeyCode>,
 }
 
 impl Player<'_> {
@@ -298,8 +305,29 @@ impl Player<'_> {
         ok
     }
 
+    /// Tracks a sustain key going down or up, sending the pedal's CC 64 when
+    /// the pedal as a whole changes state.
+    fn sustain(&mut self, key: KeyCode, down: bool) -> Result<(), midir::SendError> {
+        let was_down = !self.sustain_held.is_empty();
+        if down {
+            self.sustain_held.insert(key);
+        } else {
+            self.sustain_held.remove(&key);
+        }
+        let is_down = !self.sustain_held.is_empty();
+        if is_down != was_down {
+            self.out
+                .send(&[0xB0 | self.channel, 64, if is_down { 127 } else { 0 }])?;
+        }
+        Ok(())
+    }
+
     /// Silence everything, e.g. on exit or error, so no note is left hanging.
     fn release_all(&mut self) -> Result<(), midir::SendError> {
+        // Pedal up first, or the synth would sustain through the note-offs.
+        for key in self.sustain_held.clone() {
+            self.sustain(key, false)?;
+        }
         for key in self.held.keys().copied().collect::<Vec<_>>() {
             self.release(key)?;
         }
@@ -336,6 +364,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         (QUIT_KEY, Note(0)),
         (OCTAVE_DOWN, Note(0)),
         (OCTAVE_UP, Note(0)),
+        (SUSTAIN_KEYS[0], Note(0)),
+        (SUSTAIN_KEYS[1], Note(0)),
     ]) {
         if !supported.contains(key) {
             return Err(format!("device {:?} lacks key {key:?}", device.name()).into());
@@ -387,6 +417,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         channel: args.channel - 1,
         octave: 0,
         held: HashMap::new(),
+        sustain_held: HashSet::new(),
     };
     let result = play(&rx, &mut player, &mut velocity, args.show_timing);
     player.release_all()?;
@@ -519,6 +550,9 @@ fn play(
                     println!("Octave {:+} is the limit", player.octave);
                 }
             }
+            PRESS | RELEASE if SUSTAIN_KEYS.contains(&key) => {
+                player.sustain(key, value == PRESS)?
+            }
             PRESS if player.layout.note(key).is_some() => match velocity {
                 Velocity::Fixed(v) => player.press(key, *v)?,
                 Velocity::Measured(m) => {
@@ -542,7 +576,6 @@ fn play(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn note_of(layout: &Layout, key: KeyCode) -> u8 {
         layout.note(key).unwrap().0
@@ -563,7 +596,13 @@ mod tests {
     #[test]
     fn control_keys_unmapped() {
         let l = Layout::new(48).unwrap();
-        for key in [QUIT_KEY, OCTAVE_DOWN, OCTAVE_UP] {
+        for key in [
+            QUIT_KEY,
+            OCTAVE_DOWN,
+            OCTAVE_UP,
+            SUSTAIN_KEYS[0],
+            SUSTAIN_KEYS[1],
+        ] {
             assert_eq!(l.note(key), None);
         }
         assert_eq!(note_of(&l, KeyCode::KEY_2), 48 + 2 + 5 * 3);
