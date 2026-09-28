@@ -14,6 +14,7 @@
 //! over ALSA MIDI.
 
 mod input;
+mod recording;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -206,6 +207,10 @@ struct Args {
     /// name and leave the wiring to you (e.g. with the mouse in qpwgraph).
     #[arg(long)]
     virtual_port: Option<String>,
+    /// Also record everything sent to the synth to this Standard MIDI File
+    /// (written on exit; won't overwrite an existing file)
+    #[arg(long)]
+    record: Option<PathBuf>,
 }
 
 /// Parses a note name like "C", "F#" or "Eb" into a pitch class, 0 = C.
@@ -354,7 +359,7 @@ fn key_colors(layout: &Layout, tonic: u8) -> Colors {
 /// the synth holds the sound while the pedal is down.
 struct Player<'a> {
     layout: &'a Layout,
-    out: MidiOutputConnection,
+    out: Output,
     channel: u8, // 0-based
     /// Current octave shift; `layout` transposed by it always stays in MIDI range.
     octave: i32,
@@ -447,6 +452,21 @@ impl Player<'_> {
     }
 }
 
+/// The synth connection, optionally recording everything sent to it.
+struct Output {
+    connection: MidiOutputConnection,
+    recorder: Option<recording::Recorder>,
+}
+
+impl Output {
+    fn send(&mut self, message: &[u8]) -> Result<(), midir::SendError> {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.record(message);
+        }
+        self.connection.send(message)
+    }
+}
+
 fn main() {
     // Report errors with Display rather than the Debug formatting `main -> Result` uses.
     if let Err(e) = run() {
@@ -461,7 +481,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     layout.print_grid();
 
     // Connect before taking over the keyboard: afterwards you can't type.
-    let out = open_midi(&args)?;
+    let recording = args.record.as_deref().map(recording::create).transpose()?;
+    let out = Output {
+        connection: open_midi(&args)?,
+        recorder: recording.as_ref().map(|_| recording::Recorder::new()),
+    };
 
     let curve = || {
         Curve::new(
@@ -528,7 +552,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         sustain_held: HashSet::new(),
     };
     let result = play(source.as_mut(), &mut player, args.strike_depth);
-    player.release_all()?;
+    let released = player.release_all();
+    // Write the recording whatever happened, once every note has been ended.
+    if let (Some(file), Some(recorder)) = (recording, &player.out.recorder) {
+        recorder.write(file)?;
+        println!("Recorded to {}.", args.record.as_ref().unwrap().display());
+    }
+    released?;
     result?;
     source.finish()
 }
