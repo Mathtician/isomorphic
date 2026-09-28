@@ -22,6 +22,10 @@ pub const KEYBOARD: &str = "/dev/input/by-id/usb-Keychron_Keychron_Q1_HE-event-k
 /// The raw HID (VIA, usage page 0xFF60) interface.
 pub const HIDRAW: &str = "/dev/input/by-id/usb-Keychron_Keychron_Q1_HE-if01-hidraw";
 
+/// Matrix dimensions.
+pub const ROWS: u8 = 6;
+pub const COLS: u8 = 15;
+
 const REPORT_LEN: usize = 32;
 const CMD_ANALOG_MATRIX: u8 = 0xA9;
 const GET_REALTIME_TRAVEL: u8 = 0x30;
@@ -37,61 +41,68 @@ pub struct MatrixPos {
     pub col: u8,
 }
 
-/// Matrix position of a key on the ANSI Q1 HE, for the keys we play
-/// (from `LAYOUT_ansi_82` in keyboards/keychron/q1_he/ansi_encoder/keymaps/default/keymap.c).
+/// Matrix positions on the ANSI Q1 HE of the keys we use (from `LAYOUT_ansi_82`
+/// in keyboards/keychron/q1_he/ansi_encoder/keymaps/default/keymap.c).
+const KEYS: &[(KeyCode, MatrixPos)] = &[
+    (KeyCode::KEY_ESC, MatrixPos { row: 0, col: 0 }),
+    (KeyCode::KEY_GRAVE, MatrixPos { row: 1, col: 0 }),
+    (KeyCode::KEY_1, MatrixPos { row: 1, col: 1 }),
+    (KeyCode::KEY_2, MatrixPos { row: 1, col: 2 }),
+    (KeyCode::KEY_3, MatrixPos { row: 1, col: 3 }),
+    (KeyCode::KEY_4, MatrixPos { row: 1, col: 4 }),
+    (KeyCode::KEY_5, MatrixPos { row: 1, col: 5 }),
+    (KeyCode::KEY_6, MatrixPos { row: 1, col: 6 }),
+    (KeyCode::KEY_7, MatrixPos { row: 1, col: 7 }),
+    (KeyCode::KEY_8, MatrixPos { row: 1, col: 8 }),
+    (KeyCode::KEY_9, MatrixPos { row: 1, col: 9 }),
+    (KeyCode::KEY_0, MatrixPos { row: 1, col: 10 }),
+    (KeyCode::KEY_MINUS, MatrixPos { row: 1, col: 11 }),
+    (KeyCode::KEY_EQUAL, MatrixPos { row: 1, col: 12 }),
+    (KeyCode::KEY_Q, MatrixPos { row: 2, col: 1 }),
+    (KeyCode::KEY_W, MatrixPos { row: 2, col: 2 }),
+    (KeyCode::KEY_E, MatrixPos { row: 2, col: 3 }),
+    (KeyCode::KEY_R, MatrixPos { row: 2, col: 4 }),
+    (KeyCode::KEY_T, MatrixPos { row: 2, col: 5 }),
+    (KeyCode::KEY_Y, MatrixPos { row: 2, col: 6 }),
+    (KeyCode::KEY_U, MatrixPos { row: 2, col: 7 }),
+    (KeyCode::KEY_I, MatrixPos { row: 2, col: 8 }),
+    (KeyCode::KEY_O, MatrixPos { row: 2, col: 9 }),
+    (KeyCode::KEY_P, MatrixPos { row: 2, col: 10 }),
+    (KeyCode::KEY_LEFTBRACE, MatrixPos { row: 2, col: 11 }),
+    (KeyCode::KEY_RIGHTBRACE, MatrixPos { row: 2, col: 12 }),
+    (KeyCode::KEY_A, MatrixPos { row: 3, col: 1 }),
+    (KeyCode::KEY_S, MatrixPos { row: 3, col: 2 }),
+    (KeyCode::KEY_D, MatrixPos { row: 3, col: 3 }),
+    (KeyCode::KEY_F, MatrixPos { row: 3, col: 4 }),
+    (KeyCode::KEY_G, MatrixPos { row: 3, col: 5 }),
+    (KeyCode::KEY_H, MatrixPos { row: 3, col: 6 }),
+    (KeyCode::KEY_J, MatrixPos { row: 3, col: 7 }),
+    (KeyCode::KEY_K, MatrixPos { row: 3, col: 8 }),
+    (KeyCode::KEY_L, MatrixPos { row: 3, col: 9 }),
+    (KeyCode::KEY_SEMICOLON, MatrixPos { row: 3, col: 10 }),
+    (KeyCode::KEY_APOSTROPHE, MatrixPos { row: 3, col: 11 }),
+    // Row 4 has no switch at column 1 (the wide left shift is at 0) or 11.
+    (KeyCode::KEY_Z, MatrixPos { row: 4, col: 2 }),
+    (KeyCode::KEY_X, MatrixPos { row: 4, col: 3 }),
+    (KeyCode::KEY_C, MatrixPos { row: 4, col: 4 }),
+    (KeyCode::KEY_V, MatrixPos { row: 4, col: 5 }),
+    (KeyCode::KEY_B, MatrixPos { row: 4, col: 6 }),
+    (KeyCode::KEY_N, MatrixPos { row: 4, col: 7 }),
+    (KeyCode::KEY_M, MatrixPos { row: 4, col: 8 }),
+    (KeyCode::KEY_COMMA, MatrixPos { row: 4, col: 9 }),
+    (KeyCode::KEY_DOT, MatrixPos { row: 4, col: 10 }),
+    (KeyCode::KEY_SLASH, MatrixPos { row: 4, col: 12 }),
+    (KeyCode::KEY_LEFTSHIFT, MatrixPos { row: 4, col: 0 }),
+    (KeyCode::KEY_RIGHTSHIFT, MatrixPos { row: 4, col: 13 }),
+];
+
 pub fn matrix_pos(key: KeyCode) -> Option<MatrixPos> {
-    use KeyCode as K;
-    let (row, col) = match key {
-        K::KEY_GRAVE => (1, 0),
-        K::KEY_1 => (1, 1),
-        K::KEY_2 => (1, 2),
-        K::KEY_3 => (1, 3),
-        K::KEY_4 => (1, 4),
-        K::KEY_5 => (1, 5),
-        K::KEY_6 => (1, 6),
-        K::KEY_7 => (1, 7),
-        K::KEY_8 => (1, 8),
-        K::KEY_9 => (1, 9),
-        K::KEY_0 => (1, 10),
-        K::KEY_MINUS => (1, 11),
-        K::KEY_EQUAL => (1, 12),
-        K::KEY_Q => (2, 1),
-        K::KEY_W => (2, 2),
-        K::KEY_E => (2, 3),
-        K::KEY_R => (2, 4),
-        K::KEY_T => (2, 5),
-        K::KEY_Y => (2, 6),
-        K::KEY_U => (2, 7),
-        K::KEY_I => (2, 8),
-        K::KEY_O => (2, 9),
-        K::KEY_P => (2, 10),
-        K::KEY_LEFTBRACE => (2, 11),
-        K::KEY_RIGHTBRACE => (2, 12),
-        K::KEY_A => (3, 1),
-        K::KEY_S => (3, 2),
-        K::KEY_D => (3, 3),
-        K::KEY_F => (3, 4),
-        K::KEY_G => (3, 5),
-        K::KEY_H => (3, 6),
-        K::KEY_J => (3, 7),
-        K::KEY_K => (3, 8),
-        K::KEY_L => (3, 9),
-        K::KEY_SEMICOLON => (3, 10),
-        K::KEY_APOSTROPHE => (3, 11),
-        // Row 4 has no switch at column 1 (the wide left shift is at 0) or 11.
-        K::KEY_Z => (4, 2),
-        K::KEY_X => (4, 3),
-        K::KEY_C => (4, 4),
-        K::KEY_V => (4, 5),
-        K::KEY_B => (4, 6),
-        K::KEY_N => (4, 7),
-        K::KEY_M => (4, 8),
-        K::KEY_COMMA => (4, 9),
-        K::KEY_DOT => (4, 10),
-        K::KEY_SLASH => (4, 12),
-        _ => return None,
-    };
-    Some(MatrixPos { row, col })
+    KEYS.iter().find(|&&(k, _)| k == key).map(|&(_, p)| p)
+}
+
+/// The key at a matrix position, if it's one we use.
+pub fn key_at(pos: MatrixPos) -> Option<KeyCode> {
+    KEYS.iter().find(|&&(_, p)| p == pos).map(|&(k, _)| k)
 }
 
 /// One travel reading, timestamped at the midpoint of the request/reply round
@@ -100,6 +111,8 @@ pub fn matrix_pos(key: KeyCode) -> Option<MatrixPos> {
 pub struct Sample {
     pub time: SystemTime,
     pub travel: Travel,
+    /// The raw 12-bit Hall sensor reading behind `travel` (lower = deeper).
+    pub adc: u16,
 }
 
 pub struct Hid(File);
@@ -144,6 +157,25 @@ impl Hid {
         Ok(Sample {
             time: sent + half_trip,
             travel: reply[6],
+            adc: u16::from_le_bytes([reply[7], reply[8]]),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn positions_are_distinct_and_in_range() {
+        let positions: HashSet<_> = KEYS.iter().map(|&(_, p)| (p.row, p.col)).collect();
+        let keys: HashSet<_> = KEYS.iter().map(|&(k, _)| k).collect();
+        assert_eq!(positions.len(), KEYS.len());
+        assert_eq!(keys.len(), KEYS.len());
+        assert!(KEYS.iter().all(|&(_, p)| p.row < ROWS && p.col < COLS));
+        for &(k, p) in KEYS {
+            assert_eq!(key_at(p), Some(k));
+        }
     }
 }

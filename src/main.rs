@@ -1,4 +1,4 @@
-//! Plays a laptop keyboard as a Wicki-Hayden isomorphic MIDI controller.
+//! Plays a keyboard as a Wicki-Hayden isomorphic MIDI controller.
 //!
 //! On a standard keyboard each alphanumeric row sits roughly half a key to the
 //! right of the row above it, so the four rows form a (sheared) hex grid: the
@@ -7,23 +7,27 @@
 //! +2 semitones to a step right and +5 to a step up-left, which makes up-right
 //! +7. So the note of a key is simply `base + 2*col + 5*row`.
 //!
-//! Input is read straight from evdev (physical key positions, true key-up
-//! events, no autorepeat) with the device grabbed so keystrokes don't leak into
-//! other programs. Output is a virtual ALSA MIDI port for any synth to connect to.
+//! Keys come from one of three inputs (see `input`): the laptop keyboard via
+//! evdev at a fixed velocity; a Keychron Q1 HE on stock firmware, with velocity
+//! from polling its analog key travel; or a Keychron running our instrument
+//! firmware, which measures velocity and pressure itself. Output goes to a synth
+//! over ALSA MIDI.
+
+mod input;
 
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::mpsc,
-    thread,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
-use clap::Parser;
-use evdev::{Device, EventSummary, KeyCode};
+use clap::{Parser, ValueEnum};
+use evdev::KeyCode;
+use input::{Evdev, EvdevVelocity, Firmware, Input, Source};
 use isomorphic::{
-    keychron::{self, Hid},
-    velocity::{Curve, Measurer},
+    instrument::{self, Colors},
+    keychron::{self, Travel},
+    velocity::Curve,
 };
 use midir::{MidiOutput, MidiOutputConnection, os::unix::VirtualOutput};
 
@@ -108,51 +112,91 @@ const OCTAVE_DOWN: KeyCode = KeyCode::KEY_GRAVE;
 const OCTAVE_UP: KeyCode = KeyCode::KEY_1;
 /// Either Shift works the sustain pedal; it's down while at least one is held.
 const SUSTAIN_KEYS: [KeyCode; 2] = [KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_RIGHTSHIFT];
+const CONTROL_KEYS: [KeyCode; 5] = [
+    QUIT_KEY,
+    OCTAVE_DOWN,
+    OCTAVE_UP,
+    SUSTAIN_KEYS[0],
+    SUSTAIN_KEYS[1],
+];
 
-// evdev key event values.
-const RELEASE: i32 = 0;
-const PRESS: i32 = 1;
-const AUTOREPEAT: i32 = 2;
+/// Key travel at full depth, in 1/60 mm (4.0 mm).
+const FULL_TRAVEL: Travel = 240;
+
+/// Instrument-firmware key colours (palette indices 1..=3; 0 is unlit).
+const DIATONIC: u8 = 1;
+const CHROMATIC: u8 = 2;
+const CONTROL: u8 = 3;
+const PALETTE: [[u8; 3]; 3] = [
+    [255, 190, 120], // diatonic: warm white
+    [30, 60, 255],   // chromatic: blue
+    [255, 30, 0],    // control: red
+];
+/// Pitch classes of a major scale, relative to its tonic.
+const MAJOR_SCALE: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum InputKind {
+    /// The laptop keyboard, at a fixed velocity
+    Laptop,
+    /// A Keychron Q1 HE on stock firmware, with velocity from polling key travel
+    KeychronStock,
+    /// A Keychron Q1 HE running the instrument firmware (see firmware/)
+    Keychron,
+}
 
 #[derive(Parser)]
 #[command(
     about = "Play the keyboard as a Wicki-Hayden MIDI controller. ` and 1 shift octaves; Shift sustains; Esc quits."
 )]
 struct Args {
-    /// evdev keyboard device to read (and grab) [default: the laptop keyboard,
-    /// or the Keychron's with --keychron]
+    /// Which keyboard to play
+    #[arg(long, value_enum, default_value_t = InputKind::Laptop)]
+    input: InputKind,
+    /// evdev keyboard device to read and grab [default: the laptop keyboard,
+    /// or the Keychron's for keychron-stock]
     #[arg(long)]
     device: Option<PathBuf>,
-    /// Play a Keychron Q1 HE with velocity measured from its analog key travel
-    #[arg(long)]
-    keychron: bool,
-    /// With --keychron: depth at which a key sounds, in 1/60 mm (240 = full
-    /// travel). Must be deeper than the actuation point set in Keychron Launcher.
-    #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u8).range(1..=230))]
+    /// For laptop input: note-on velocity
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u8).range(1..=127))]
+    velocity: u8,
+    /// Keychron: depth at which a key sounds, in 1/60 mm (240 = full travel).
+    /// For keychron-stock it must be deeper than the actuation point set in
+    /// Keychron Launcher.
+    #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u8).range(2..=230))]
     strike_depth: u8,
-    /// With --keychron: descent time (actuation to strike depth, ms) at or
-    /// below which velocity is 127
+    /// keychron: depth where descent timing starts (1/60 mm); a key must rise
+    /// above it again before it can strike again
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u8).range(1..=229))]
+    start_depth: u8,
+    /// keychron: a sounding key's note stops when it rises above this depth (1/60 mm)
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u8).range(1..=230))]
+    release_depth: u8,
+    /// keychron: smallest travel change (1/60 mm) reported as new pressure
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=255))]
+    pressure_step: u8,
+    /// Keychron: descent time (ms) at or below which velocity is 127
     #[arg(long, default_value_t = 2.0)]
     fast_ms: f64,
-    /// With --keychron: descent time (ms) at or above which velocity is --min-velocity
+    /// Keychron: descent time (ms) at or above which velocity is --min-velocity
     #[arg(long, default_value_t = 40.0)]
     slow_ms: f64,
-    /// With --keychron: velocity of the slowest presses
+    /// Keychron: velocity of the slowest presses
     #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u8).range(1..=127))]
     min_velocity: u8,
-    /// With --keychron: print each note's descent time and velocity, for tuning
+    /// Keychron: print each note's descent time and velocity, for tuning
     /// --fast-ms and --slow-ms
     #[arg(long)]
     show_timing: bool,
+    /// keychron: major key whose scale lights up as diatonic (e.g. C, G, Eb, F#)
+    #[arg(long, default_value = "C", value_parser = parse_pitch_class)]
+    key: u8,
     /// MIDI note number of the Z key (48 = C3)
     #[arg(long, default_value_t = 48)]
     base: u8,
     /// MIDI channel
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=16))]
     channel: u8,
-    /// Note-on velocity (laptop keys aren't velocity-sensitive)
-    #[arg(long, conflicts_with = "keychron", default_value_t = 100, value_parser = clap::value_parser!(u8).range(1..=127))]
-    velocity: u8,
     /// Connect directly to the one MIDI input port whose name contains this
     /// (e.g. "FLUID" for fluidsynth). The connection is made before the
     /// keyboard is grabbed, since afterwards you can't type anywhere else.
@@ -162,6 +206,38 @@ struct Args {
     /// name and leave the wiring to you (e.g. with the mouse in qpwgraph).
     #[arg(long)]
     virtual_port: Option<String>,
+}
+
+/// Parses a note name like "C", "F#" or "Eb" into a pitch class, 0 = C.
+fn parse_pitch_class(s: &str) -> Result<u8, String> {
+    let mut chars = s.chars();
+    let base: i32 = match chars.next().map(|c| c.to_ascii_uppercase()) {
+        Some('C') => 0,
+        Some('D') => 2,
+        Some('E') => 4,
+        Some('F') => 5,
+        Some('G') => 7,
+        Some('A') => 9,
+        Some('B') => 11,
+        _ => return Err(format!("{s:?} isn't a note name like C, F# or Eb")),
+    };
+    let accidental = match chars.as_str() {
+        "" => 0,
+        "#" => 1,
+        "b" => -1,
+        _ => return Err(format!("{s:?} isn't a note name like C, F# or Eb")),
+    };
+    Ok((base + accidental).rem_euclid(12) as u8)
+}
+
+/// Aftertouch for a struck key's travel: 0 at the strike depth, 127 at full travel.
+fn aftertouch(travel: Travel, strike_depth: Travel) -> u8 {
+    assert!(strike_depth < FULL_TRAVEL);
+    let past = travel
+        .saturating_sub(strike_depth)
+        .min(FULL_TRAVEL - strike_depth);
+    ((past as u32 * 127 + (FULL_TRAVEL - strike_depth) as u32 / 2)
+        / (FULL_TRAVEL - strike_depth) as u32) as u8
 }
 
 /// A MIDI note number; always < 128.
@@ -236,6 +312,32 @@ impl Layout {
             println!("{indent}{labels}\n{indent}{notes}\n");
         }
     }
+}
+
+/// Which palette colour each Keychron key shows: note keys by whether their
+/// pitch is in the major scale on `tonic`, control keys in their own colour.
+fn key_colors(layout: &Layout, tonic: u8) -> Colors {
+    let mut colors: Colors = Default::default();
+    let mut set = |key: KeyCode, color: u8| {
+        let pos =
+            keychron::matrix_pos(key).unwrap_or_else(|| panic!("no matrix position for {key:?}"));
+        colors[pos.row as usize][pos.col as usize] = color;
+    };
+    for &(key, note) in &layout.keys {
+        let degree = (note.0 + 12 - tonic) % 12;
+        set(
+            key,
+            if MAJOR_SCALE.contains(&degree) {
+                DIATONIC
+            } else {
+                CHROMATIC
+            },
+        );
+    }
+    for key in CONTROL_KEYS {
+        set(key, CONTROL);
+    }
+    colors
 }
 
 /// Tracks which mapped keys are down and turns key transitions into MIDI.
@@ -335,6 +437,14 @@ impl Player<'_> {
         // All Notes Off, in case the synth disagrees with us about what's sounding.
         self.out.send(&[0xB0 | self.channel, 123, 0])
     }
+
+    /// Polyphonic aftertouch for the note a held key is sounding.
+    fn aftertouch(&mut self, key: KeyCode, pressure: u8) -> Result<(), midir::SendError> {
+        match self.held.get(&key) {
+            Some(note) => self.out.send(&[0xA0 | self.channel, note.0, pressure]),
+            None => Ok(()),
+        }
+    }
 }
 
 fn main() {
@@ -350,66 +460,64 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let layout = Layout::new(args.base)?;
     layout.print_grid();
 
-    let device_path = args.device.clone().unwrap_or_else(|| {
-        PathBuf::from(if args.keychron {
-            keychron::KEYBOARD
-        } else {
-            "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
-        })
-    });
-    let mut device = Device::open(&device_path)
-        .map_err(|e| format!("opening {}: {e} (no read access?)", device_path.display()))?;
-    let supported = device.supported_keys().ok_or("device reports no keys")?;
-    for &(key, _) in layout.keys.iter().chain(&[
-        (QUIT_KEY, Note(0)),
-        (OCTAVE_DOWN, Note(0)),
-        (OCTAVE_UP, Note(0)),
-        (SUSTAIN_KEYS[0], Note(0)),
-        (SUSTAIN_KEYS[1], Note(0)),
-    ]) {
-        if !supported.contains(key) {
-            return Err(format!("device {:?} lacks key {key:?}", device.name()).into());
-        }
-    }
+    // Connect before taking over the keyboard: afterwards you can't type.
+    let out = open_midi(&args)?;
 
-    let mut velocity = if args.keychron {
-        for &(key, _) in &layout.keys {
-            assert!(
-                keychron::matrix_pos(key).is_some(),
-                "no matrix position for {key:?}"
-            );
-        }
-        let hid = Hid::open(keychron::HIDRAW)
-            .map_err(|e| format!("opening {}: {e} (no read/write access?)", keychron::HIDRAW))?;
-        let curve = Curve::new(
+    let curve = || {
+        Curve::new(
             Duration::from_secs_f64(args.fast_ms / 1000.0),
             Duration::from_secs_f64(args.slow_ms / 1000.0),
             args.min_velocity,
-        )?;
-        Velocity::Measured(Measurer::new(hid, curve, args.strike_depth))
-    } else {
-        Velocity::Fixed(args.velocity)
+        )
     };
-
-    let out = open_midi(&args)?;
-    println!("Reading {:?}.", device.name().unwrap_or("?"));
-
-    // Grabbing while a key is down (e.g. the Enter that launched us) would
-    // swallow its release, leaving the terminal autorepeating it forever.
-    if device.get_key_state()?.iter().next().is_some() {
-        println!("Waiting for all keys to be released...");
-        while device.get_key_state()?.iter().next().is_some() {
-            thread::sleep(Duration::from_millis(10));
+    let mut evdev_keys: Vec<KeyCode> = layout.keys.iter().map(|&(k, _)| k).collect();
+    evdev_keys.extend(CONTROL_KEYS);
+    let mut source: Box<dyn Source> = match args.input {
+        InputKind::Laptop => {
+            let path = args
+                .device
+                .clone()
+                .unwrap_or_else(|| "/dev/input/by-path/platform-i8042-serio-0-event-kbd".into());
+            Box::new(Evdev::open(
+                &path,
+                &evdev_keys,
+                EvdevVelocity::Fixed(args.velocity),
+            )?)
         }
-    }
-    device.grab()?;
-    println!("Keyboard grabbed. Play! Esc quits.");
-
-    // Key events come from a thread blocking on the device, so the main loop
-    // can poll key travel while waiting for them. The grab ends when the
-    // process exits and the device is closed.
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || read_keys(device, tx));
+        InputKind::KeychronStock => {
+            let path = args
+                .device
+                .clone()
+                .unwrap_or_else(|| keychron::KEYBOARD.into());
+            let note_keys = layout.keys.iter().map(|&(k, _)| k).collect();
+            let velocity =
+                EvdevVelocity::polled(curve()?, args.strike_depth, note_keys, args.show_timing)?;
+            Box::new(Evdev::open(&path, &evdev_keys, velocity)?)
+        }
+        InputKind::Keychron => {
+            let config = instrument::Config {
+                start: args.start_depth,
+                strike: args.strike_depth,
+                release: args.release_depth,
+                pressure_step: args.pressure_step,
+            };
+            if !(config.start < config.strike && config.release <= config.strike) {
+                return Err(
+                    "need --start-depth < --strike-depth and --release-depth <= --strike-depth"
+                        .into(),
+                );
+            }
+            let colors = key_colors(&layout, args.key);
+            Box::new(Firmware::open(
+                config,
+                curve()?,
+                PALETTE,
+                &colors,
+                args.show_timing,
+            )?)
+        }
+    };
+    println!("Play! Esc quits.");
 
     let mut player = Player {
         layout: &layout,
@@ -419,42 +527,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         held: HashMap::new(),
         sustain_held: HashSet::new(),
     };
-    let result = play(&rx, &mut player, &mut velocity, args.show_timing);
+    let result = play(source.as_mut(), &mut player, args.strike_depth);
     player.release_all()?;
-    result
-}
-
-/// Where note-on velocities come from.
-enum Velocity {
-    Fixed(u8),
-    Measured(Measurer),
-}
-
-struct KeyEvent {
-    key: KeyCode,
-    value: i32,
-    time: SystemTime,
-}
-
-/// Forwards key events until the device fails or the receiver is gone.
-fn read_keys(mut device: Device, tx: mpsc::Sender<Result<KeyEvent, String>>) {
-    loop {
-        let events = match device.fetch_events() {
-            Ok(events) => events,
-            Err(e) => {
-                let _ = tx.send(Err(format!("reading keyboard: {e}")));
-                return;
-            }
-        };
-        for event in events {
-            if let EventSummary::Key(_, key, value) = event.destructure() {
-                let time = event.timestamp();
-                if tx.send(Ok(KeyEvent { key, value, time })).is_err() {
-                    return;
-                }
-            }
-        }
-    }
+    result?;
+    source.finish()
 }
 
 fn open_midi(args: &Args) -> Result<MidiOutputConnection, Box<dyn std::error::Error>> {
@@ -492,57 +568,18 @@ fn open_midi(args: &Args) -> Result<MidiOutputConnection, Box<dyn std::error::Er
 }
 
 /// Runs until the quit key is pressed or an error occurs.
-///
-/// While any key is on its way down (only with measured velocity), key events
-/// are checked between travel polls; otherwise we just wait for the next one.
 fn play(
-    rx: &mpsc::Receiver<Result<KeyEvent, String>>,
+    source: &mut dyn Source,
     player: &mut Player,
-    velocity: &mut Velocity,
-    show_timing: bool,
+    strike_depth: Travel,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let polling = match velocity {
-            Velocity::Measured(m) => !m.is_idle(),
-            Velocity::Fixed(_) => false,
-        };
-        let event = if polling {
-            match rx.try_recv() {
-                Ok(event) => Some(event),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    unreachable!("reader exits only after sending an error, which ends play")
-                }
-            }
-        } else {
-            Some(
-                rx.recv()
-                    .expect("reader thread reports errors before exiting"),
-            )
-        };
-
-        let Some(event) = event else {
-            let Velocity::Measured(m) = velocity else {
-                unreachable!("only measured velocity polls")
-            };
-            if let Some(strike) = m.poll()? {
-                if show_timing {
-                    println!(
-                        "{:?}: {:.1} ms -> velocity {}",
-                        strike.key,
-                        strike.descent.as_secs_f64() * 1000.0,
-                        strike.velocity
-                    );
-                }
-                player.press(strike.key, strike.velocity)?;
-            }
-            continue;
-        };
-
-        let KeyEvent { key, value, time } = event?;
-        match value {
-            PRESS if key == QUIT_KEY => return Ok(()),
-            PRESS if key == OCTAVE_DOWN || key == OCTAVE_UP => {
+        match source.next()? {
+            Input::Down { key: QUIT_KEY, .. } => return Ok(()),
+            Input::Down {
+                key: key @ (OCTAVE_DOWN | OCTAVE_UP),
+                ..
+            } => {
                 let delta = if key == OCTAVE_UP { 1 } else { -1 };
                 if player.shift_octave(delta) {
                     println!("Octave {:+}", player.octave);
@@ -550,25 +587,13 @@ fn play(
                     println!("Octave {:+} is the limit", player.octave);
                 }
             }
-            PRESS | RELEASE if SUSTAIN_KEYS.contains(&key) => {
-                player.sustain(key, value == PRESS)?
+            Input::Down { key, .. } if SUSTAIN_KEYS.contains(&key) => player.sustain(key, true)?,
+            Input::Down { key, velocity } => player.press(key, velocity)?,
+            Input::Up { key } if SUSTAIN_KEYS.contains(&key) => player.sustain(key, false)?,
+            Input::Up { key } => player.release(key)?,
+            Input::Pressure { key, travel } => {
+                player.aftertouch(key, aftertouch(travel, strike_depth))?
             }
-            PRESS if player.layout.note(key).is_some() => match velocity {
-                Velocity::Fixed(v) => player.press(key, *v)?,
-                Velocity::Measured(m) => {
-                    let pos = keychron::matrix_pos(key).expect("checked at startup");
-                    m.press(key, pos, time);
-                }
-            },
-            PRESS => {}
-            RELEASE => {
-                if let Velocity::Measured(m) = velocity {
-                    m.release(key);
-                }
-                player.release(key)?;
-            }
-            AUTOREPEAT => {}
-            v => return Err(format!("unexpected key event value {v} for {key:?}").into()),
         }
     }
 }
@@ -626,6 +651,50 @@ mod tests {
     fn base_range() {
         assert!(Layout::new(127 - 37).is_ok());
         assert!(Layout::new(127 - 36).is_err());
+    }
+
+    #[test]
+    fn pitch_classes() {
+        assert_eq!(parse_pitch_class("C"), Ok(0));
+        assert_eq!(parse_pitch_class("f#"), Ok(6));
+        assert_eq!(parse_pitch_class("Eb"), Ok(3));
+        assert_eq!(parse_pitch_class("Cb"), Ok(11));
+        assert_eq!(parse_pitch_class("B#"), Ok(0));
+        assert!(parse_pitch_class("H").is_err());
+        assert!(parse_pitch_class("C##").is_err());
+        assert!(parse_pitch_class("").is_err());
+    }
+
+    #[test]
+    fn aftertouch_range() {
+        assert_eq!(aftertouch(0, 180), 0);
+        assert_eq!(aftertouch(180, 180), 0);
+        assert_eq!(aftertouch(210, 180), 64); // halfway, rounded
+        assert_eq!(aftertouch(240, 180), 127);
+        assert_eq!(aftertouch(245, 180), 127);
+    }
+
+    #[test]
+    fn scale_colors() {
+        let l = Layout::new(48).unwrap(); // z = C3
+        let color = |colors: &Colors, key| {
+            let p = keychron::matrix_pos(key).unwrap();
+            colors[p.row as usize][p.col as usize]
+        };
+        let c_major = key_colors(&l, 0);
+        assert_eq!(color(&c_major, KeyCode::KEY_Z), DIATONIC); // C
+        assert_eq!(color(&c_major, KeyCode::KEY_V), CHROMATIC); // F#
+        assert_eq!(color(&c_major, KeyCode::KEY_A), DIATONIC); // F
+        assert_eq!(color(&c_major, KeyCode::KEY_Q), CHROMATIC); // Bb
+        assert_eq!(color(&c_major, KeyCode::KEY_ESC), CONTROL);
+        assert_eq!(color(&c_major, KeyCode::KEY_1), CONTROL);
+        assert_eq!(c_major[2][0], 0); // Tab, unused: unlit
+        let g_major = key_colors(&l, 7);
+        assert_eq!(color(&g_major, KeyCode::KEY_V), DIATONIC); // F#
+        assert_eq!(color(&g_major, KeyCode::KEY_A), CHROMATIC); // F
+        // Exactly the note and control keys are lit.
+        let lit = c_major.iter().flatten().filter(|&&c| c != 0).count();
+        assert_eq!(lit, l.keys.len() + CONTROL_KEYS.len());
     }
 
     #[test]

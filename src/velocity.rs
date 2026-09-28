@@ -176,6 +176,7 @@ mod tests {
 
     fn sample(t_ms: f64, travel: Travel) -> Sample {
         Sample {
+            adc: 0,
             time: SystemTime::UNIX_EPOCH + ms(t_ms),
             travel,
         }

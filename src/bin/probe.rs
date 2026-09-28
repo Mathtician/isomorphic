@@ -1,5 +1,5 @@
-//! Measures how fast one Keychron HE key's analog travel can be polled over raw
-//! HID, and records a travel trace while you press it.
+//! Records one Keychron HE key's analog travel over raw HID while you press it:
+//! how fast it can be polled, and a trace of travel and the raw sensor reading.
 
 use std::time::{Duration, SystemTime};
 
@@ -15,6 +15,10 @@ struct Args {
     /// How long to poll, in seconds
     #[arg(long, default_value_t = 5.0)]
     seconds: f64,
+    /// Also log changes of at least this much in the raw sensor reading
+    /// (useful at full travel, where travel itself is clamped)
+    #[arg(long, default_value_t = 3)]
+    adc_step: u16,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,17 +31,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let start = SystemTime::now();
     let mut round_trips = Vec::new();
-    let mut trace: Vec<(Duration, u8)> = Vec::new();
+    let mut trace: Vec<(Duration, u8, u16)> = Vec::new();
     println!(
         "Polling {pos:?} for {}s; press the key a few times.",
         args.seconds
     );
     while start.elapsed()?.as_secs_f64() < args.seconds {
         let sent = SystemTime::now();
-        let sample = hid.travel(pos)?;
+        let s = hid.travel(pos)?;
         round_trips.push(sent.elapsed()?);
-        if trace.last().is_none_or(|&(_, t)| t != sample.travel) {
-            trace.push((sample.time.duration_since(start)?, sample.travel));
+        let changed = trace.last().is_none_or(|&(_, travel, adc)| {
+            travel != s.travel || adc.abs_diff(s.adc) >= args.adc_step
+        });
+        if changed {
+            trace.push((s.time.duration_since(start)?, s.travel, s.adc));
         }
     }
 
@@ -51,10 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pct(0.99),
         pct(1.0),
     );
-    println!("\ntravel trace (only changes; travel in 1/60 mm, 240 = 4.0 mm):");
-    for (t, travel) in trace {
+    println!("\ntime (ms)  travel (1/60 mm, 240 = 4.0 mm)  raw sensor");
+    for (t, travel, adc) in trace {
         println!(
-            "{:9.3} ms  {travel:3}  {}",
+            "{:9.3}  {travel:3} {:<61}  {adc}",
             t.as_secs_f64() * 1000.0,
             "#".repeat(travel as usize / 4)
         );
