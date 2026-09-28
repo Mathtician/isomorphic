@@ -1,0 +1,3 @@
+qmk_firmware/
+*.bin
+test/test_core
