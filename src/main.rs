@@ -485,10 +485,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?)
         }
         InputKind::KeychronStock => {
-            let path = args
-                .device
-                .clone()
-                .unwrap_or_else(|| keychron::KEYBOARD.into());
+            let path = match args.device.clone() {
+                Some(path) => path,
+                None => keychron::device(keychron::KEYBOARD)?,
+            };
             let note_keys = layout.keys.iter().map(|&(k, _)| k).collect();
             let velocity =
                 EvdevVelocity::polled(curve()?, args.strike_depth, note_keys, args.show_timing)?;

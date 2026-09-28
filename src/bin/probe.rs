@@ -23,7 +23,7 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let mut hid = Hid::open(keychron::HIDRAW)?;
+    let mut hid = Hid::open(keychron::device(keychron::HIDRAW)?)?;
     let pos = MatrixPos {
         row: args.row,
         col: args.col,

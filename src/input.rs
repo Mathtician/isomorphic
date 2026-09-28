@@ -83,8 +83,9 @@ impl EvdevVelocity {
                 "no matrix position for {key:?}"
             );
         }
-        let hid = Hid::open(keychron::HIDRAW)
-            .map_err(|e| format!("opening {}: {e} (no read/write access?)", keychron::HIDRAW))?;
+        let path = keychron::device(keychron::HIDRAW)?;
+        let hid = Hid::open(&path)
+            .map_err(|e| format!("opening {}: {e} (no read/write access?)", path.display()))?;
         Ok(EvdevVelocity::Polled {
             measurer: Measurer::new(hid, curve, strike_depth),
             note_keys,
@@ -258,7 +259,7 @@ impl Firmware {
         colors: &Colors,
         show_timing: bool,
     ) -> Result<Firmware, Box<dyn Error>> {
-        let (mut instrument, rx) = Instrument::open(keychron::HIDRAW)?;
+        let (mut instrument, rx) = Instrument::open(keychron::device(keychron::HIDRAW)?)?;
         instrument.set_colors(palette, colors)?;
         instrument.stats()?; // reset, so the stats printed at the end cover playing
         instrument.enter(config)?;

@@ -11,16 +11,41 @@ use std::{
     error::Error,
     fs::{File, OpenOptions},
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::SystemTime,
 };
 
 use evdev::KeyCode;
 
-/// The keyboard's ordinary key-event device.
-pub const KEYBOARD: &str = "/dev/input/by-id/usb-Keychron_Keychron_Q1_HE-event-kbd";
-/// The raw HID (VIA, usage page 0xFF60) interface.
-pub const HIDRAW: &str = "/dev/input/by-id/usb-Keychron_Keychron_Q1_HE-if01-hidraw";
+/// Suffixes of the keyboard's /dev/input/by-id names: its ordinary key-event
+/// device, and its raw HID (VIA, usage page 0xFF60) interface.
+pub const KEYBOARD: &str = "-event-kbd";
+pub const HIDRAW: &str = "-if01-hidraw";
+
+/// Finds the keyboard's device whose by-id name ends in `suffix`. The name
+/// starts with the USB manufacturer and product, and includes a serial number
+/// only on some firmware (ours has one, stock doesn't), so match around it.
+pub fn device(suffix: &str) -> Result<PathBuf, String> {
+    const DIR: &str = "/dev/input/by-id";
+    const PREFIX: &str = "usb-Keychron_Keychron_Q1_HE";
+    let entries = std::fs::read_dir(DIR).map_err(|e| format!("listing {DIR}: {e}"))?;
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(PREFIX) && name.ends_with(suffix)
+        })
+        .map(|e| e.path())
+        .collect();
+    match found.len() {
+        1 => Ok(found.pop().unwrap()),
+        0 => Err(format!(
+            "no {DIR}/{PREFIX}*{suffix}; is the Keychron plugged in (by USB)?"
+        )),
+        _ => Err(format!("several Keychron devices match: {found:?}")),
+    }
+}
 
 /// Matrix dimensions.
 pub const ROWS: u8 = 6;
