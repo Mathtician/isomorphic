@@ -1,2 +1,4 @@
 target/
 result
+# MIDI recordings from --record
+*.mid
